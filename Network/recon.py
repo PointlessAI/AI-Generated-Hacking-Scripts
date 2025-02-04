@@ -1,201 +1,288 @@
 #!/usr/bin/env python3
 
-import os
-import subprocess
 import argparse
 import logging
+import subprocess
 import ipaddress
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
 
-# Make sure Sublist3r is installed:
-# pip install sublist3r
-try:
-    from sublist3r import Sublist3r
-except ImportError:
-    Sublist3r = None
+# Load environment variables from the .env file
+load_dotenv()
 
+# Initialize OpenAI client with the API key from environment variables
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
 
-# Configure logging
+# ----------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------
+# Default timeouts (in seconds) for various commands.
+TIMEOUT_SHORT = 5
+TIMEOUT_MEDIUM = 10
+TIMEOUT_LONG = 30
+TIMEOUT_VERY_LONG = 60
+
+# ----------------------------------------------------
+# LOGGING SETUP
+# ----------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-
-def run_command(command):
+# ----------------------------------------------------
+# HELPER FUNCTIONS
+# ----------------------------------------------------
+def run_command(command, timeout=TIMEOUT_SHORT):
     """
-    Runs a shell command securely and logs its output and errors.
-    Returns the command's STDOUT on success or a string with error details on failure.
+    Runs a shell command with a configurable timeout.
+    Logs and returns the STDOUT on success.
+    On error or timeout, returns an error string.
     """
-    logging.debug(f"Executing command: {command}")
+    logging.debug(f"Executing command: {command} (timeout={timeout}s)")
     try:
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
-            check=True
+            timeout=timeout
         )
-        # Log any stderr output
+        # If the command returned a non-zero code, handle it
+        if result.returncode != 0:
+            err = result.stderr.strip()
+            if not err:
+                err = "Unknown error or no stderr."
+            logging.error(f"Command '{command}' failed with return code {result.returncode}: {err}")
+            return f"Error: {err}"
+        
+        # Log any stderr output, even if return code was 0
         if result.stderr.strip():
-            logging.error(f"Command produced error output: {result.stderr.strip()}")
+            logging.warning(f"Command produced stderr: {result.stderr.strip()}")
         return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Command '{command}' failed with error:\n{e.stderr}")
-        return f"Error: {e.stderr.strip()}"
 
-
-def subdomain_enum(domain):
-    """
-    Use Sublist3r (a Python-based tool) to enumerate subdomains.
-    Returns a string containing the discovered subdomains or an error message if Sublist3r not available.
-    """
-    if Sublist3r is None:
-        return "Sublist3r not installed. Please install via 'pip install sublist3r'."
-    try:
-        logging.info(f"Enumerating subdomains for {domain} with Sublist3r...")
-        subdomains = Sublist3r.main(domain, 40, None, ports=None, silent=True, verbose=False, enable_bruteforce=False)
-        return "\n".join(subdomains)
+    except subprocess.TimeoutExpired:
+        msg = f"Error: Command timed out after {timeout}s"
+        logging.error(msg)
+        return msg
     except Exception as e:
-        logging.error(f"Subdomain enumeration failed: {e}")
-        return f"Error enumerating subdomains: {str(e)}"
+        msg = f"Error: {str(e)}"
+        logging.error(msg)
+        return msg
 
 
-def attempt_zone_transfer(domain):
+def whois_lookup(target):
+    # Whois can hang; use a medium timeout
+    return run_command(f"whois {target}", timeout=TIMEOUT_MEDIUM)
+
+
+def is_behind_aws_or_cloudflare(target):
     """
-    Attempt a DNS zone transfer for the domain by querying each authoritative nameserver.
-    Return the consolidated result of all zone transfer attempts.
+    Uses whois output to determine if a domain or IP
+    is hosted behind AWS or Cloudflare. If so,
+    returns True; otherwise False.
+    """
+    logging.info(f"Checking if {target} is behind AWS or Cloudflare...")
+    w = whois_lookup(target)
+    w_lower = w.lower()
+    # Simple heuristic checks
+    if "amazon" in w_lower or "aws" in w_lower or "cloudflare" in w_lower:
+        logging.info(f"Detected AWS/Cloudflare references in WHOIS for {target}.")
+        return True
+    return False
+
+
+# ----------------------------------------------------
+# DOMAIN SCANS
+# ----------------------------------------------------
+def attempt_zone_transfer(domain, timeout=TIMEOUT_SHORT):
+    """
+    Attempt a DNS zone transfer for the domain by querying its
+    authoritative nameservers. Returns the consolidated result.
+    Applies a short timeout to each dig attempt.
     """
     results = []
-    # First, get the nameservers
+
     logging.info(f"Attempting to retrieve nameservers for zone transfer of {domain}...")
-    ns_output = run_command(f"dig NS {domain} +short")
+    ns_output = run_command(f"dig NS {domain} +short", timeout=timeout)
     if "Error:" in ns_output:
         return ns_output  # Contains the error message
 
     nameservers = ns_output.splitlines()
+    if not nameservers:
+        return "No NS records found or unable to retrieve NS."
 
-    # Try AXFR from each NS
     for ns in nameservers:
         ns = ns.strip()
         if not ns:
             continue
         logging.info(f"Trying zone transfer from NS: {ns}")
-        zone_result = run_command(f"dig axfr {domain} @{ns}")
-        if "Transfer failed." in zone_result or "XFR size" not in zone_result:
+        zone_result = run_command(f"dig axfr {domain} @{ns}", timeout=timeout)
+        zr_lower = zone_result.lower()
+        if any(err in zr_lower for err in ["transfer failed", "failed", "denied"]) or "xfr size" not in zr_lower:
             results.append(f"Zone transfer from {ns} failed or returned no data.")
         else:
             results.append(f"Zone transfer successful from {ns}:\n{zone_result}")
 
-    return "\n\n".join(results)
-
-
-def whois_lookup(target):
-    return run_command(f"whois {target}")
+    return "\n\n".join(results).strip()
 
 
 def domain_info(domain):
     """
-    Gather domain-related information.
+    Gather domain-related information with timeouts and minimal scanning.
     """
     logging.info(f"Gathering domain info for {domain}...")
+
+    # Check if domain is behind AWS or Cloudflare
+    behind_aws_or_cf = is_behind_aws_or_cloudflare(domain)
+
     results = {
         "whois": whois_lookup(domain),
-        "nslookup": run_command(f"nslookup {domain}"),
-        "host": run_command(f"host {domain}"),
-        "dig_any": run_command(f"dig ANY {domain}"),
-        "dig_ns": run_command(f"dig {domain} NS"),
-        "dig_mx": run_command(f"dig {domain} MX"),
-        "dig_txt": run_command(f"dig {domain} TXT"),
-        "zone_transfer": attempt_zone_transfer(domain),
-        "traceroute": run_command(f"traceroute {domain}"),
-        "nmap": run_command(f"nmap -Pn -p 1-1000 {domain}"),
-        "curl_headers": run_command(f"curl -I https://{domain}"),
-        "subdomain_enum": subdomain_enum(domain),
-        # Additional network recon for a domain (web apps):
-        "whatweb": run_command(f"whatweb {domain}"),
-        "nikto_scan": run_command(f"nikto -host https://{domain}")
+        "nslookup": run_command(f"nslookup {domain}", timeout=TIMEOUT_SHORT),
+        "host": run_command(f"host {domain}", timeout=TIMEOUT_SHORT),
+        "dig_any": run_command(f"dig ANY {domain}", timeout=TIMEOUT_SHORT),
+        "dig_ns": run_command(f"dig {domain} NS", timeout=TIMEOUT_SHORT),
+        "dig_mx": run_command(f"dig {domain} MX", timeout=TIMEOUT_SHORT),
+        "dig_txt": run_command(f"dig {domain} TXT", timeout=TIMEOUT_SHORT),
     }
+
+    # Skip zone transfer if behind AWS or Cloudflare (almost always blocked)
+    if behind_aws_or_cf:
+        results["zone_transfer"] = "Skipped - Domain behind AWS/Cloudflare"
+    else:
+        results["zone_transfer"] = attempt_zone_transfer(domain)
+
+    # traceroute can sometimes hang longer, give it a bit more time
+    results["traceroute"] = run_command(f"traceroute {domain}", timeout=TIMEOUT_MEDIUM)
+
+    # Basic nmap. Keep the port range limited for quicker runs
+    results["nmap"] = run_command(f"nmap -Pn -p 1-1000 {domain}", timeout=TIMEOUT_LONG)
+
+    # Check basic headers with a short timeout
+    results["curl_headers"] = run_command(f"curl -I https://{domain}", timeout=TIMEOUT_SHORT)
+
     return results
 
 
+# ----------------------------------------------------
+# IP SCANS
+# ----------------------------------------------------
 def network_info(ip):
     """
-    Gather network-related information for a given IP.
-    Including a /24 subnet scan to show other live hosts.
+    Gather network-related information for an IP. Minimal scans to reduce hang risk.
     """
     logging.info(f"Gathering network info for {ip}...")
 
-    # Attempt to build the /24 network for scanning
-    # If 'ip' is already a single IP, we create the network (e.g., 192.168.1.0/24).
-    # If ipaddress parsing fails, fallback to a direct approach or skip.
+    # Attempt to parse the IP for potential /24. (We won't do a big subnet scan here.)
     try:
-        address_obj = ipaddress.ip_address(ip)
-        network_addr = ipaddress.ip_network(f"{address_obj}/24", strict=False)
-        subnet = str(network_addr)
+        ipaddress.ip_address(ip)  # Validate
     except ValueError:
-        # Fallback if the user didn't provide a plain IP or if there's an error
-        # You might skip or do some naive string manipulation
-        # For safety, let's skip the /24 if we can't parse properly
-        subnet = ip  # fallback
+        pass  # We'll just assume it's an IP we can handle
+
+    # Check AWS/Cloudflare
+    behind_aws_or_cf = is_behind_aws_or_cloudflare(ip)
 
     results = {
         "whois": whois_lookup(ip),
-        # We can still keep fping, which is a good quick approach:
-        "fping_subnet_scan": run_command(f"fping -a -g {subnet} 2>/dev/null"),
-        # Alternatively, you can do an nmap ping scan:
-        "nmap_subnet_scan": run_command(f"nmap -sn {subnet}"),
-        "reverse_dns": run_command(f"dig -x {ip}"),
-        "traceroute": run_command(f"traceroute {ip}"),
-        "nmap_common_ports": run_command(f"nmap -Pn -p 22,80,443 {ip}"),
-        "curl_headers": run_command(f"curl -I https://{ip}"),
+        "reverse_dns": run_command(f"dig -x {ip}", timeout=TIMEOUT_SHORT),
+        "traceroute": run_command(f"traceroute {ip}", timeout=TIMEOUT_MEDIUM),
+        "nmap_common_ports": run_command(f"nmap -Pn -p 22,80,443 {ip}", timeout=TIMEOUT_LONG),
+        "curl_headers": run_command(f"curl -I https://{ip}", timeout=TIMEOUT_SHORT),
     }
+
+    # If behind AWS/CF, skip attempts that are often blocked or moot.
+    if behind_aws_or_cf:
+        results["notes"] = "IP belongs to AWS or Cloudflare; skipping advanced scans."
+
     return results
 
 
 def port_scan(ip):
     """
-    Perform a comprehensive port scan.
+    Perform a more comprehensive port scan with short or medium timeouts.
     """
     logging.info(f"Performing port scans on {ip}...")
     results = {
-        "basic_ping": run_command(f"ping -c 3 {ip}"),
-        "basic_nmap": run_command(f"nmap -Pn {ip}"),
-        "common_ports": run_command(f"nmap -p 1-1000 {ip}"),
-        "full_ports": run_command(f"nmap -p- {ip}"),
-        "service_detection": run_command(f"nmap -sV {ip}"),
-        "os_detection": run_command(f"nmap -O {ip}"),
-        "banner_grabbing": run_command(f"nmap --script banner {ip}"),
-        "vulnerability_scan": run_command(f"nmap --script vuln {ip}"),
+        "basic_ping": run_command(f"ping -c 3 {ip}", timeout=TIMEOUT_SHORT),
+        "basic_nmap": run_command(f"nmap -Pn {ip}", timeout=TIMEOUT_LONG),
+        "common_ports": run_command(f"nmap -p 1-1000 {ip}", timeout=TIMEOUT_LONG),
+        "full_ports": run_command(f"nmap -p- {ip}", timeout=TIMEOUT_VERY_LONG),
+        "service_detection": run_command(f"nmap -sV {ip}", timeout=TIMEOUT_LONG),
+        "os_detection": run_command(f"nmap -O {ip}", timeout=TIMEOUT_LONG),
     }
     return results
 
 
+# ----------------------------------------------------
+# CHATGPT REQUESTS
+# ----------------------------------------------------
+def chatgpt_request(scan_results):
+    """
+    Sends the user's content to OpenAI Chat API in the required messages format.
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",  # or "gpt-3.5-turbo"
+            messages=[{"role": "system", "content": "Produce a detailed red team network recon report based on the provided output."},{"role": "user", "content": scan_results}]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logging.error(f"OpenAI API request failed: {str(e)}")
+        return f"Error from OpenAI API: {str(e)}"
+
+
+# ----------------------------------------------------
+# SAVING RESULTS
+# ----------------------------------------------------
 def save_results(target, results):
     """
-    Save the scan results to a file.
+    Save the scan results to a file, then generate and save AI-processed results.
     """
     filename = f"scan_results_{target}.txt"
+    ai_filename = f"ai_scan_results_{target}.md"
+
     logging.info(f"Saving results to {filename}...")
+
     try:
-        with open(filename, "w") as f:
+        # Write raw scan results to filename
+        with open(filename, "w", encoding="utf-8") as f:
             for section, output in results.items():
                 f.write(f"\n[{section.upper()}]\n")
-                f.write(output + "\n" + "-" * 50 + "\n")
-        logging.info(f"Results saved to {filename}")
+                f.write((output or "") + "\n" + "-" * 50 + "\n")
+
+        # Read the saved results
+        with open(filename, "r", encoding="utf-8") as f:
+            file_content = f.read()
+
+        # Process the file content using the ChatGPT request
+        ai_proc_file = chatgpt_request(file_content)
+
+        # Write AI-processed results to ai_filename
+        with open(ai_filename, "w", encoding="utf-8") as f:
+            f.write(ai_proc_file)
+
+        logging.info(f"AI-processed results saved to {ai_filename}")
+
     except Exception as e:
         logging.error(f"Failed to save results to {filename}: {e}")
 
 
+# ----------------------------------------------------
+# MAIN
+# ----------------------------------------------------
 def main():
-    logging.info("Starting the Comprehensive Domain & Network Scanner...")
-    parser = argparse.ArgumentParser(description="Comprehensive Domain & Network Scanner")
+    logging.info("Starting the (Less Hanging) Comprehensive Scanner...")
+    parser = argparse.ArgumentParser(description="Comprehensive Domain & Network Scanner (Reduced Hang Version)")
     parser.add_argument("target", help="Domain name or IP address to scan")
     args = parser.parse_args()
 
     target = args.target
     results = {}
 
-    # Simple heuristic: if the target has any alphabetic character, assume it's a domain.
+    # Simple heuristic: if the target has any alphabetic character, assume domain
     if any(c.isalpha() for c in target):
         logging.info(f"Target '{target}' appears to be a domain.")
         results = domain_info(target)
