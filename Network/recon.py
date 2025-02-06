@@ -95,6 +95,31 @@ def is_behind_aws_or_cloudflare(target):
     return False
 
 
+def get_ip_from_domain(domain):
+    """
+    Resolves the domain name into its first valid IPv4 address using 'dig'.
+    Returns the IP as a string or None if no valid A record is found.
+    """
+    logging.info(f"Resolving domain '{domain}' to IP...")
+    dig_output = run_command(f"dig +short A {domain}", timeout=TIMEOUT_SHORT)
+    if "Error:" in dig_output or not dig_output.strip():
+        logging.error(f"Could not resolve domain '{domain}' to an IP. dig output:\n{dig_output}")
+        return None
+
+    # Check each line in the output to see if it's an IPv4
+    for line in dig_output.splitlines():
+        line = line.strip()
+        try:
+            ipaddress.ip_address(line)
+            # If it's a valid IP, return it
+            return line
+        except ValueError:
+            pass
+
+    logging.error(f"No valid IPv4 addresses found for domain '{domain}'.")
+    return None
+
+
 # ----------------------------------------------------
 # DOMAIN SCANS
 # ----------------------------------------------------
@@ -156,10 +181,10 @@ def domain_info(domain):
         results["zone_transfer"] = attempt_zone_transfer(domain)
 
     # traceroute can sometimes hang longer, give it a bit more time
-    results["traceroute"] = run_command(f"traceroute {domain}", timeout=TIMEOUT_MEDIUM)
+    results["traceroute"] = run_command(f"traceroute {domain}", timeout=TIMEOUT_VERY_LONG)
 
     # Basic nmap. Keep the port range limited for quicker runs
-    results["nmap"] = run_command(f"nmap -Pn -p 1-1000 {domain}", timeout=TIMEOUT_LONG)
+    results["nmap"] = run_command(f"nmap -Pn -p 1-3000 {domain}", timeout=TIMEOUT_LONG)
 
     # Check basic headers with a short timeout
     results["curl_headers"] = run_command(f"curl -I https://{domain}", timeout=TIMEOUT_SHORT)
@@ -176,11 +201,12 @@ def network_info(ip):
     """
     logging.info(f"Gathering network info for {ip}...")
 
-    # Attempt to parse the IP for potential /24. (We won't do a big subnet scan here.)
+    # Attempt to parse the IP for potential validation
     try:
-        ipaddress.ip_address(ip)  # Validate
+        ipaddress.ip_address(ip)
     except ValueError:
-        pass  # We'll just assume it's an IP we can handle
+        logging.warning(f"IP '{ip}' is invalid, skipping advanced scans.")
+        return {"error": f"Invalid IP: {ip}"}
 
     # Check AWS/Cloudflare
     behind_aws_or_cf = is_behind_aws_or_cloudflare(ip)
@@ -189,7 +215,7 @@ def network_info(ip):
         "whois": whois_lookup(ip),
         "reverse_dns": run_command(f"dig -x {ip}", timeout=TIMEOUT_SHORT),
         "traceroute": run_command(f"traceroute {ip}", timeout=TIMEOUT_MEDIUM),
-        "nmap_common_ports": run_command(f"nmap -Pn -p 22,80,443 {ip}", timeout=TIMEOUT_LONG),
+        "nmap_common_ports": run_command(f"nmap -Pn -p 1-3000 {ip}", timeout=TIMEOUT_LONG),
         "curl_headers": run_command(f"curl -I https://{ip}", timeout=TIMEOUT_SHORT),
     }
 
@@ -208,7 +234,7 @@ def port_scan(ip):
     results = {
         "basic_ping": run_command(f"ping -c 3 {ip}", timeout=TIMEOUT_SHORT),
         "basic_nmap": run_command(f"nmap -Pn {ip}", timeout=TIMEOUT_LONG),
-        "common_ports": run_command(f"nmap -p 1-1000 {ip}", timeout=TIMEOUT_LONG),
+        "common_ports": run_command(f"nmap -p 1-3000 {ip}", timeout=TIMEOUT_LONG),
         "full_ports": run_command(f"nmap -p- {ip}", timeout=TIMEOUT_VERY_LONG),
         "service_detection": run_command(f"nmap -sV {ip}", timeout=TIMEOUT_LONG),
         "os_detection": run_command(f"nmap -O {ip}", timeout=TIMEOUT_LONG),
@@ -226,7 +252,10 @@ def chatgpt_request(scan_results):
     try:
         response = client.chat.completions.create(
             model="gpt-4",  # or "gpt-3.5-turbo"
-            messages=[{"role": "system", "content": "Produce a detailed red team network recon report based on the provided output."},{"role": "user", "content": scan_results}]
+            messages=[
+                {"role": "system", "content": "Produce a detailed red team network recon report based on the provided output."},
+                {"role": "user", "content": scan_results}
+            ]
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -251,7 +280,13 @@ def save_results(target, results):
         with open(filename, "w", encoding="utf-8") as f:
             for section, output in results.items():
                 f.write(f"\n[{section.upper()}]\n")
-                f.write((output or "") + "\n" + "-" * 50 + "\n")
+                if isinstance(output, dict):
+                    # If output is another dictionary, flatten it
+                    for sub_section, sub_output in output.items():
+                        f.write(f"--- {sub_section} ---\n{sub_output}\n\n")
+                else:
+                    f.write((output or "") + "\n")
+                f.write("-" * 50 + "\n")
 
         # Read the saved results
         with open(filename, "r", encoding="utf-8") as f:
@@ -276,25 +311,35 @@ def save_results(target, results):
 def main():
     logging.info("Starting the (Less Hanging) Comprehensive Scanner...")
     parser = argparse.ArgumentParser(description="Comprehensive Domain & Network Scanner (Reduced Hang Version)")
-    parser.add_argument("target", help="Domain name or IP address to scan")
+    parser.add_argument("domain", help="Domain name to scan")
     args = parser.parse_args()
 
-    target = args.target
+    domain = args.domain
     results = {}
 
-    # Simple heuristic: if the target has any alphabetic character, assume domain
-    if any(c.isalpha() for c in target):
-        logging.info(f"Target '{target}' appears to be a domain.")
-        results = domain_info(target)
-    else:
-        logging.info(f"Target '{target}' appears to be an IP address.")
-        # Perform network recon
-        results.update(network_info(target))
-        # Also do port scans
-        results.update(port_scan(target))
+    # 1) Perform domain scans
+    logging.info(f"Performing domain scans for: {domain}")
+    domain_results = domain_info(domain)
+    results["domain_scans"] = domain_results
 
-    # Finally, save results to file
-    save_results(target, results)
+    # 2) Resolve domain to IP (first valid IPv4 found)
+    ip = get_ip_from_domain(domain)
+    if ip:
+        logging.info(f"Domain '{domain}' resolved to IP '{ip}'. Proceeding with IP scans.")
+        # 3) Perform network recon on IP
+        ip_results = network_info(ip)
+        results["ip_recon"] = ip_results
+
+        # 4) Perform port scans on IP
+        port_results = port_scan(ip)
+        results["ip_port_scans"] = port_results
+    else:
+        logging.warning(f"Could not resolve '{domain}' to an IP. Skipping IP-based scans.")
+        results["ip_recon"] = {"error": f"Could not resolve domain '{domain}' to an IP address."}
+        results["ip_port_scans"] = {"error": "No IP-based scans performed."}
+
+    # 5) Save results to file (and run ChatGPT summarization)
+    save_results(domain, results)
     logging.info("Scanning completed.")
 
 

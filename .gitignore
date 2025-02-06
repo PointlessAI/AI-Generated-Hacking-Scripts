@@ -1,4 +1,5 @@
 bug-venv
+root-venv
 Python-3.12.3
 chatgpt.py
 .env
