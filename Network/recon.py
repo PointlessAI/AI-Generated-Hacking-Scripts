@@ -247,7 +247,7 @@ def port_scan(ip):
 # ----------------------------------------------------
 def chatgpt_request(scan_results):
     """
-    Sends the user's content to OpenAI Chat API in the required messages format.
+    Generate report using ChatGPT API
     """
     try:
         response = client.chat.completions.create(
